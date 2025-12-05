@@ -4,6 +4,47 @@ const fs = require("fs");
 const path = require("path");
 const { exec, execSync } = require("child_process");
 
+const net = require("net");
+
+// Cek apakah port sedang digunakan
+const isPortAvailable = (port) => {
+  return new Promise((resolve) => {
+    const tester = net
+      .createServer()
+      .once("error", (err) => {
+        if (err.code === "EADDRINUSE") resolve(false); // port dipakai
+        else resolve(false); // error lain, dianggap tidak tersedia
+      })
+      .once("listening", () => {
+        tester.close();
+        resolve(true); // port tersedia
+      })
+      .listen(port, "0.0.0.0");
+  });
+};
+
+// Generate public port unik
+const generatePublicPort = async () => {
+  const min = 15000;
+  const max = 16000;
+
+  const [rows] = await pool.query("SELECT public_port FROM tunnels");
+  const usedPorts = rows.map((r) => r.public_port);
+
+  const availablePorts = [];
+  for (let i = min; i <= max; i++) {
+    if (!usedPorts.includes(i)) {
+      const available = await isPortAvailable(i);
+      if (available) availablePorts.push(i);
+    }
+  }
+
+  if (availablePorts.length === 0) throw new Error("No available ports");
+
+  const randomIndex = Math.floor(Math.random() * availablePorts.length);
+  return availablePorts[randomIndex];
+};
+
 // CCD helper
 const createCCDFile = (username, vpn_ip) => {
   const ccdDir = "/etc/openvpn/ccd";
@@ -79,33 +120,45 @@ const getVPNs = async (req, res) => {
   }
 };
 
+// Generate VPN IP dari subnet 10.30.0.0/24 yang belum dipakai
+const generateVPNIP = async () => {
+  const subnet = "10.30.0.";
+  const [rows] = await pool.query("SELECT vpn_ip FROM tunnels");
+  const usedIPs = rows.map((r) => r.vpn_ip);
+
+  for (let i = 2; i < 255; i++) {
+    // 10.30.0.1 biasanya gateway server
+    const ip = subnet + i;
+    if (!usedIPs.includes(ip)) return ip;
+  }
+
+  throw new Error("No available VPN IPs");
+};
+
 // ===== ADD VPN =====
 const addVPN = async (req, res) => {
   try {
-    const {
-      user_id,
-      name,
-      username,
-      password,
-      subdomain,
-      public_port,
-      private_port,
-      vpn_ip
-    } = req.body;
+    // Ambil user_id dari token
+    const user_id = req.user.id;
 
-    const hash = await bcrypt.hash(password, 10);
+    const { username, password, private_port } = req.body;
 
+    // Generate public port otomatis yang unik dan tersedia
+    const public_port = await generatePublicPort();
+
+    // Generate VPN IP otomatis yang tersedia
+    const vpn_ip = await generateVPNIP();
+
+    // Insert ke database
     const sql = `
       INSERT INTO tunnels
-      (user_id, name, username, password, subdomain, public_port, private_port, vpn_ip, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')
+      (user_id, username, password, public_port, private_port, vpn_ip, status)
+      VALUES ( ?, ?, ?, ?, ?, ?, 'active')
     `;
     const [result] = await pool.query(sql, [
       user_id,
-      name,
       username,
-      hash,
-      subdomain,
+      password,
       public_port,
       private_port,
       vpn_ip
@@ -116,13 +169,13 @@ const addVPN = async (req, res) => {
 
     // Forward port otomatis
     exec(
-      `/etc/openvpn/scripts/add_vpn_forward.sh ${public_port} ${vpn_ip} ${private_port}`,
+      `/www/wwwroot/docker/vpnremot/backend/service/add_vpn_forward.sh ${public_port} ${vpn_ip} ${private_port}`,
       (err) => {
         if (err) console.error("Forward port error:", err);
       }
     );
 
-    res.json({ message: "VPN remote added", id: result.insertId });
+    res.json({ message: "VPN remote added", id: result.insertId, public_port });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
