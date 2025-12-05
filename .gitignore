@@ -9,6 +9,12 @@ yarn-error.log*
 package-lock.json
 yarn.lock
 
+*.rar
+*.zip
+*.7z
+*.tar.gz
+*.exe   
+
 # =================================
 # Environment Variables (SANGAT PENTING)
 # =================================
