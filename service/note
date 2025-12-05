@@ -1,1 +1,28 @@
 Jangan lupa chmod +x add_vpn_forward.sh remove_vpn_forward.sh.
+
+#!/bin/bash
+
+PUBLIC_PORT=$1
+VPN_IP=$2
+PRIVATE_PORT=$3
+
+echo "[DEBUG] Adding DNAT: $PUBLIC_PORT -> $VPN_IP:$PRIVATE_PORT" >> /tmp/vpn_forward.log
+
+# Buat chain FORWARD_BT jika belum ada
+sudo iptables -t nat -N FORWARD_BT 2>/dev/null || echo "[DEBUG] Chain FORWARD_BT sudah ada" >> /tmp/vpn_forward.log
+
+# Masukkan chain FORWARD_BT ke PREROUTING jika belum ada
+sudo iptables -t nat -C PREROUTING -j FORWARD_BT 2>/dev/null || \
+sudo iptables -t nat -A PREROUTING -j FORWARD_BT
+
+# Cek rule sebelum menambahkan
+sudo iptables -t nat -C FORWARD_BT -p tcp --dport $PUBLIC_PORT -j DNAT --to-destination $VPN_IP:$PRIVATE_PORT 2>/dev/null
+if [ $? -ne 0 ]; then
+    sudo iptables -t nat -A FORWARD_BT -p tcp --dport $PUBLIC_PORT -j DNAT --to-destination $VPN_IP:$PRIVATE_PORT
+    echo "[DEBUG] Rule ditambahkan: $PUBLIC_PORT -> $VPN_IP:$PRIVATE_PORT" >> /tmp/vpn_forward.log
+else
+    echo "[DEBUG] Rule sudah ada, skip: $PUBLIC_PORT -> $VPN_IP:$PRIVATE_PORT" >> /tmp/vpn_forward.log
+fi
+
+# Dump rules ke log
+sudo iptables -t nat -L FORWARD_BT -n -v >> /tmp/vpn_forward.log

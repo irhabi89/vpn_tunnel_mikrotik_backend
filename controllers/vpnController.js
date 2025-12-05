@@ -3,6 +3,10 @@ const bcrypt = require("bcryptjs");
 const fs = require("fs");
 const path = require("path");
 const { exec, execSync } = require("child_process");
+const util = require("util");
+const execPromise = util.promisify(exec);
+const getActiveVPNClients = require("../fungtion/getActiveVPNClients");
+const Log = require("../models/Log");
 
 const net = require("net");
 
@@ -66,26 +70,6 @@ const getPeerIP = (vpn_ip) => {
   return parts.join(".");
 };
 
-// Utility: baca active VPN dari OpenVPN status
-const getActiveVPNs = () => {
-  const statusPath = "/run/openvpn/server.status";
-  if (!fs.existsSync(statusPath)) return [];
-  const lines = fs.readFileSync(statusPath, "utf8").split("\n");
-  const active = [];
-  lines.forEach((line) => {
-    if (line.startsWith("CLIENT_LIST")) {
-      const parts = line.split("\t");
-      active.push({
-        username: parts[1],
-        vpn_ip: parts[2],
-        real_ip: parts[3],
-        connected_since: parts[7]
-      });
-    }
-  });
-  return active;
-};
-
 const getVPNs = async (req, res) => {
   try {
     const { role, id: userId } = req.user; // id = user_id, role = admin/user
@@ -103,20 +87,46 @@ const getVPNs = async (req, res) => {
     const [rows] = await pool.query(sql, params);
 
     // Ambil daftar active VPN
-    const activeVPNs = getActiveVPNs();
+    const activeVPNs = await getActiveVPNs();
 
     const data = rows.map((vpn) => {
-      const active = activeVPNs.find((a) => a.username === vpn.username);
       return {
-        ...vpn,
-        active: !!active,
-        real_ip: active?.real_ip || null
+        ...vpn
       };
     });
 
     res.json(data);
   } catch (err) {
+    console.error("[GET VPNs] Error:", err); // Tambahkan log untuk melihat errornya
     res.status(500).json({ error: err.message });
+  }
+};
+
+// ===== VPN SERVER STATUS (VERSI DITINGKATKAN) =====
+const getVPNServerStatus = async (req, res) => {
+  // === BOM DEBUG ===
+  console.log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+  console.log("!!! getVPNServerStatus FUNCTION CALLED !!!");
+  console.log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+  // ===================
+
+  try {
+    console.log("[VPN STATUS] Checking OpenVPN server status via systemctl...");
+
+    const { stdout } = await execPromise(
+      "systemctl is-active openvpn@server.service"
+    );
+
+    const status = stdout.trim();
+
+    // === BOM DEBUG ===
+    console.log("--- About to call getActiveVPNs ---");
+    // ===================
+    // res.json({ status, clients });
+    res.json({ status });
+  } catch (err) {
+    console.error("[VPN STATUS] Error checking OpenVPN status:", err.message);
+    res.json({ status: "inactive", clients: 0 });
   }
 };
 
@@ -124,30 +134,46 @@ const getVPNs = async (req, res) => {
 const generateVPNIP = async () => {
   const subnet = "10.30.0.";
   const [rows] = await pool.query("SELECT vpn_ip FROM tunnels");
-  const usedIPs = rows.map((r) => r.vpn_ip);
+  const usedIPs = new Set(rows.map((r) => r.vpn_ip));
 
   for (let i = 2; i < 255; i++) {
-    // 10.30.0.1 biasanya gateway server
     const ip = subnet + i;
-    if (!usedIPs.includes(ip)) return ip;
+    if (!usedIPs.has(ip)) return ip;
   }
 
   throw new Error("No available VPN IPs");
 };
 
+const runScript = (command, description) => {
+  exec(command, (err, stdout, stderr) => {
+    console.log(`[SCRIPT] ${description}`);
+    console.log(`[SCRIPT] Command: ${command}`);
+
+    if (err) {
+      console.error(`[SCRIPT] ERROR:`, err);
+    }
+    if (stdout) console.log(`[SCRIPT] STDOUT:\n${stdout}`);
+    if (stderr) console.error(`[SCRIPT] STDERR:\n${stderr}`);
+  });
+};
+
 // ===== ADD VPN =====
 const addVPN = async (req, res) => {
   try {
+    console.log("[ADD VPN] Request body:", req.body);
     // Ambil user_id dari token
     const user_id = req.user.id;
+    console.log("[ADD VPN] user_id from token:", user_id);
 
     const { username, password, private_port } = req.body;
 
     // Generate public port otomatis yang unik dan tersedia
     const public_port = await generatePublicPort();
+    console.log("[ADD VPN] Generated public_port:", public_port);
 
     // Generate VPN IP otomatis yang tersedia
     const vpn_ip = await generateVPNIP();
+    console.log("[ADD VPN] Generated VPN IP:", vpn_ip);
 
     // Insert ke database
     const sql = `
@@ -163,20 +189,31 @@ const addVPN = async (req, res) => {
       private_port,
       vpn_ip
     ]);
+    console.log("[ADD VPN] Database insert result:", result);
 
     // Buat CCD file
     createCCDFile(username, vpn_ip);
+    console.log("[ADD VPN] CCD file created for:", username);
 
     // Forward port otomatis
-    exec(
-      `/www/wwwroot/docker/vpnremot/backend/service/add_vpn_forward.sh ${public_port} ${vpn_ip} ${private_port}`,
-      (err) => {
-        if (err) console.error("Forward port error:", err);
-      }
+    console.log("[🚀] runScript");
+    runScript(
+      `sudo /www/wwwroot/docker/vpnremot/backend/service/add_vpn_forward.sh ${public_port} ${vpn_ip} ${private_port}`,
+      `Add VPN forward for ${username}`
     );
+
+    // -------------- LOG --------------
+    await Log.write({
+      user_id,
+      action: "create",
+      target_table: "tunnels",
+      target_id: result.insertId,
+      message: `Created VPN: ${username}, IP: ${vpn_ip}, public port: ${public_port}`
+    });
 
     res.json({ message: "VPN remote added", id: result.insertId, public_port });
   } catch (err) {
+    console.error("[ADD VPN] Error:", err);
     res.status(500).json({ error: err.message });
   }
 };
@@ -185,40 +222,28 @@ const addVPN = async (req, res) => {
 const updateVPN = async (req, res) => {
   try {
     const { id } = req.params;
-    const {
-      name,
-      username,
-      password,
-      subdomain,
-      public_port,
-      private_port,
-      vpn_ip,
-      status
-    } = req.body;
+    console.log("[UPDATE VPN] VPN ID:", id);
+    const { username, password, public_port, private_port, vpn_ip, status } =
+      req.body;
 
     const [rows] = await pool.query("SELECT * FROM tunnels WHERE id=?", [id]);
-    if (!rows.length) return res.status(404).json({ error: "VPN not found" });
+    if (!rows.length) {
+      console.log("[UPDATE VPN] VPN not found");
+      return res.status(404).json({ error: "VPN not found" });
+    }
     const oldVPN = rows[0];
+    console.log("[UPDATE VPN] Old VPN data:", oldVPN);
 
     const params = [];
     let sql = "UPDATE tunnels SET ";
 
-    if (name) {
-      sql += "name=?, ";
-      params.push(name);
-    }
     if (username) {
       sql += "username=?, ";
       params.push(username);
     }
     if (password) {
-      const hash = await bcrypt.hash(password, 10);
       sql += "password=?, ";
-      params.push(hash);
-    }
-    if (subdomain) {
-      sql += "subdomain=?, ";
-      params.push(subdomain);
+      params.push(password);
     }
     if (public_port) {
       sql += "public_port=?, ";
@@ -237,38 +262,47 @@ const updateVPN = async (req, res) => {
       params.push(status);
     }
 
-    sql = sql.slice(0, -2);
-    sql += " WHERE id=?";
+    sql = sql.slice(0, -2) + " WHERE id=?";
     params.push(id);
 
     await pool.query(sql, params);
+    console.log("[UPDATE VPN] VPN updated successfully");
 
     // Jika ada perubahan username atau vpn_ip, update CCD
     if (username || vpn_ip) {
       removeCCDFile(oldVPN.username);
       createCCDFile(username || oldVPN.username, vpn_ip || oldVPN.vpn_ip);
+      console.log("[UPDATE VPN] CCD file updated");
     }
 
     // Update forward port jika ada perubahan
     if (public_port || private_port || vpn_ip) {
-      exec(
-        `/etc/openvpn/scripts/remove_vpn_forward.sh ${oldVPN.public_port} ${oldVPN.vpn_ip} ${oldVPN.private_port}`,
-        (err) => {
-          if (err) console.error("Remove forward error:", err);
-        }
+      runScript(
+        `sudo /www/wwwroot/docker/vpnremot/backend/service/remove_vpn_forward.sh ${oldVPN.public_port} ${oldVPN.vpn_ip} ${oldVPN.private_port}`,
+        `Remove old VPN forward for ${oldVPN.username}`
       );
-      exec(
-        `/etc/openvpn/scripts/add_vpn_forward.sh ${
+
+      runScript(
+        `sudo /www/wwwroot/docker/vpnremot/backend/service/add_vpn_forward.sh ${
           public_port || oldVPN.public_port
         } ${vpn_ip || oldVPN.vpn_ip} ${private_port || oldVPN.private_port}`,
-        (err) => {
-          if (err) console.error("Add forward error:", err);
-        }
+        `Add new VPN forward for ${username || oldVPN.username}`
       );
     }
 
+    await Log.write({
+      user_id: req.user.id,
+      action: "update",
+      target_table: "tunnels",
+      target_id: id,
+      message: `Updated VPN ${oldVPN.username}. Changed fields: ${Object.keys(
+        req.body
+      ).join(", ")}`
+    });
+
     res.json({ message: "VPN remote updated" });
   } catch (err) {
+    console.error("[UPDATE VPN] Error:", err);
     res.status(500).json({ error: err.message });
   }
 };
@@ -277,39 +311,102 @@ const updateVPN = async (req, res) => {
 const deleteVPN = async (req, res) => {
   try {
     const { id } = req.params;
-    const [rows] = await pool.query("SELECT * FROM tunnels WHERE id=?", [id]);
-    if (!rows.length) return res.status(404).json({ error: "VPN not found" });
-    const vpn = rows[0];
-
-    // Hapus CCD file
-    removeCCDFile(vpn.username);
-
-    // Hapus forward port
-    exec(
-      `/etc/openvpn/scripts/remove_vpn_forward.sh ${vpn.public_port} ${vpn.vpn_ip} ${vpn.private_port}`,
-      (err) => {
-        if (err) console.error("Remove forward port error:", err);
-      }
+    const { id: tokenUserId, role } = req.user; // dari token
+    console.log(
+      "[DELETE VPN] VPN ID:",
+      id,
+      "User:",
+      tokenUserId,
+      "Role:",
+      role
     );
 
+    const [rows] = await pool.query("SELECT * FROM tunnels WHERE id=?", [id]);
+    if (!rows.length) {
+      console.log("[DELETE VPN] VPN not found");
+      return res.status(404).json({ error: "VPN not found" });
+    }
+    const vpn = rows[0];
+
+    // Validasi user
+    if (vpn.user_id !== tokenUserId && role !== "admin") {
+      console.log(
+        "[DELETE VPN] Unauthorized delete attempt by user:",
+        tokenUserId
+      );
+      return res.status(403).json({ error: "Unauthorized to delete this VPN" });
+    }
+
+    console.log("[DELETE VPN] VPN data:", vpn);
+
+    // 1️⃣ Hapus CCD file
+    removeCCDFile(vpn.username);
+    console.log("[DELETE VPN] CCD file removed");
+
+    // 2️⃣ Hapus port forwarding
+    runScript(
+      `sudo /www/wwwroot/docker/vpnremot/backend/service/remove_vpn_forward.sh ${vpn.public_port} ${vpn.vpn_ip} ${vpn.private_port}`,
+      `Remove VPN forward for ${vpn.username}`
+    );
+
+    // 3️⃣ Putus koneksi OpenVPN client jika masih aktif
+    try {
+      const clientList = execSync(
+        "cat /run/openvpn/server.status | grep CLIENT_LIST"
+      )
+        .toString()
+        .split("\n");
+      clientList.forEach((line) => {
+        if (!line) return;
+        const parts = line.split("\t");
+        const username = parts[1];
+        if (username === vpn.username) {
+          console.log(`[DELETE VPN] Disconnecting client: ${username}`);
+          execSync(
+            `sudo /www/wwwroot/docker/vpnremot/backend/service/disconnect_client.sh ${username}`
+          );
+        }
+      });
+    } catch (err) {
+      console.log(
+        "[DELETE VPN] No active client to disconnect or error:",
+        err.message
+      );
+    }
+
+    // 4️⃣ Hapus record dari database
     await pool.query("DELETE FROM tunnels WHERE id=?", [id]);
-    res.json({ message: "VPN remote deleted" });
+    console.log("[DELETE VPN] VPN deleted from database");
+
+    await Log.write({
+      user_id: tokenUserId,
+      action: "delete",
+      target_table: "tunnels",
+      target_id: id,
+      message: `Deleted VPN ${vpn.username}, IP: ${vpn.vpn_ip}, public_port: ${vpn.public_port}`
+    });
+
+    res.json({ message: "VPN remote deleted cleanly" });
+  } catch (err) {
+    console.error("[DELETE VPN] Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+};
+
+const listActiveVPNClients = async (req, res) => {
+  try {
+    const clients = await getActiveVPNClients();
+    res.json({ clients: clients });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 };
 
-// ===== VPN SERVER STATUS =====
-const getVPNServerStatus = (req, res) => {
-  try {
-    const status = execSync("systemctl is-active openvpn@server")
-      .toString()
-      .trim();
-    const clients = getActiveVPNs().length;
-    res.json({ status, clients });
-  } catch (err) {
-    res.json({ status: "inactive", clients: 0 });
-  }
+module.exports = {
+  getVPNs,
+  addVPN,
+  updateVPN,
+  deleteVPN,
+  getVPNServerStatus,
+  listActiveVPNClients
 };
-
-module.exports = { getVPNs, addVPN, updateVPN, deleteVPN, getVPNServerStatus };
